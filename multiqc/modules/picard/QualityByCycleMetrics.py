@@ -13,8 +13,8 @@ log = logging.getLogger(__name__)
 def parse_reports(self):
     """Find Picard QualityByCycleMetrics reports and parse their data"""
 
-    headers = ["CYCLE", "MEAN_QUALITY"]
-    formats = [int, float]
+    headers = ["CYCLE", "MEAN_QUALITY", "MEAN_ORIGINAL_QUALITY"]
+    formats = [int, float, float]
     all_data = read_histogram(
         self,
         "picard/quality_by_cycle",
