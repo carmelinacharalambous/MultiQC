@@ -13,6 +13,10 @@ from multiqc.plots import linegraph, table
 from multiqc.plots.table_object import ColumnDict, TableConfig
 from multiqc.types import ColumnKey
 
+import numpy as np
+from scipy.stats import gaussian_kde
+from collections import defaultdict
+
 # Initialise the logger
 log = logging.getLogger(__name__)
 
@@ -206,8 +210,11 @@ def parse_reports(module: BaseMultiqcModule) -> Set[str]:
             plot=hs_pen_plot,
         )
 
+    # Parse and plot per-target coverage info
+    _parse_target_coverage(module)
     # Return the number of detected samples to the parent module
     return set(data_by_sample.keys())
+
 
 
 def _general_stats_table(module: BaseMultiqcModule, data: Dict[str, Any]):
@@ -412,6 +419,114 @@ def _add_target_bases(module: BaseMultiqcModule, data: Dict[str, Dict[str, Any]]
         "description": "The percentage of all target bases with at least <code>x</code> fold coverage.",
         "plot": linegraph.plot(data_clean, pconfig),
     }
+
+def _parse_target_coverage(module: BaseMultiqcModule):
+    """Parse the per target coverage info"""
+
+    parsed_data: Dict[str, Dict[str, Any]] = dict()
+    module.picard_target_cov_data = dict()
+
+    per_target_cov_files = module.find_log_files("picard/hsmetrics_per_target_coverage", filehandles=True)
+    non_numeric_headers = ['chrom', 'start', 'end', 'length', 'name']
+
+    for f in per_target_cov_files:
+        try:
+            s_name = f['s_name'].replace('_per_target_coverage', '')
+
+            if s_name in parsed_data:
+                log.debug("Duplicate sample name found {}!".format(s_name))
+            module.add_data_source(f, s_name, section="HsMetrics")
+
+            parsed_data[s_name] = dict()
+            headers = []
+
+            for line in f["f"]:
+                if 'chrom' in line:
+                    headers = line.strip().split('\t')
+                    parsed_data[s_name] = {header: [] for header in headers}
+                    continue
+
+                vals = line.strip().split('\t')
+
+                for i, val in enumerate(vals):
+                    if headers[i] not in non_numeric_headers:
+                        parsed_data[s_name][headers[i]].append(float(val))
+                    else:
+                        parsed_data[s_name][headers[i]].append(val)
+        except Exception:
+            continue
+
+    parsed_data = module.ignore_samples(parsed_data)
+    numeric_headers = list(set(headers).difference(set(['chrom', 'start', 'end', 'length', 'name', '%gc'])))
+    gc_intervals = np.arange(0, 1, 0.05)
+
+    for s_name, s_data in parsed_data.items():
+        module.picard_target_cov_data[s_name] = {}
+        module.picard_target_cov_data[s_name]['gc_bias'] = {i: [] for i in numeric_headers}
+        module.picard_target_cov_data[s_name]['gc_bias']['%gc'] = [round(i, 2) for i in gc_intervals.tolist()]
+        gc_binned = np.digitize(parsed_data[s_name]['%gc'], gc_intervals) - 1
+
+        for header in numeric_headers:
+            for bin_index in range(len(gc_intervals)):
+                vals = np.array(parsed_data[s_name][header])
+                if len(vals[gc_binned == bin_index]) > 0:
+                    vals_avg = vals[gc_binned == bin_index].mean()
+                else:
+                    vals_avg = 0
+                module.picard_target_cov_data[s_name]['gc_bias'][header].append(vals_avg)
+
+        # Normalized coverage distribution
+        module.picard_target_cov_data[s_name]['normalized_coverage'] = {'coverage': [], 'frequency': []}
+        try:
+            gkde = gaussian_kde(parsed_data[s_name]['normalized_coverage'])
+            coverage = np.arange(0, 2.5, 0.01)
+            frequency = gkde.evaluate(coverage)
+            module.picard_target_cov_data[s_name]['normalized_coverage']['coverage'] = coverage.tolist()
+            module.picard_target_cov_data[s_name]['normalized_coverage']['frequency'] = frequency.tolist()
+        except Exception:
+            continue
+
+    pdata_gc_bias = {}
+    pdata_coverage = {}
+    for s_name, s_data in module.picard_target_cov_data.items():
+        pdata_gc_bias[s_name] = dict(zip(s_data['gc_bias']['%gc'], s_data['gc_bias']['normalized_coverage']))
+        pdata_coverage[s_name] = dict(zip(
+            s_data['normalized_coverage']['coverage'],
+            s_data['normalized_coverage']['frequency']))
+
+    if len(module.picard_target_cov_data) > 0:
+        module.write_data_file(module.picard_target_cov_data, "multiqc_picard_target_coverage")
+
+        # GC Bias Plot
+        pconfig = {
+            "id": "picard_target_coverage_gc_bias",
+            "title": "Picard: GC Bias",
+            "ylab": "Normalized coverage",
+            "xlab": "GC Content",
+            "tt_label": "<b>%GC {point.x}</b>: {point.y:.2f}",
+        }
+        module.add_section(
+            name="Target GC Bias",
+            anchor="picard_target_gc_bias_metrics",
+            description="Plot shows coverage metrics vs GC bias.",
+            plot=linegraph.plot(pdata_gc_bias, pconfig),
+        )
+
+        # Coverage Distribution Plot
+        pconfig = {
+            "id": "picard_target_coverage_distribution",
+            "title": "Picard: Coverage Distribution",
+            "ylab": "Frequency",
+            "xlab": "Normalized Coverage",
+            "tt_label": "<b>Coverage {point.x}</b>: {point.y:.2f}",
+        }
+        module.add_section(
+            name="Target Coverage Distribution",
+            anchor="picard_target_coverage_distribution",
+            description="Plot shows the median-normalized coverage distribution over the targets.",
+            plot=linegraph.plot(pdata_coverage, pconfig),
+        )
+
 
 
 def hs_penalty_plot(module: BaseMultiqcModule, data: Dict[str, Dict[str, Any]]):
